@@ -63,7 +63,7 @@ type NodeClass interface {
 
 type Provider interface {
 	Get(context.Context, NodeClass, ec2types.InstanceType) (*cloudprovider.InstanceType, error)
-	List(context.Context, NodeClass) ([]*cloudprovider.InstanceType, error)
+	List(context.Context, NodeClass, bool) ([]*cloudprovider.InstanceType, error)
 }
 
 type DefaultProvider struct {
@@ -120,7 +120,7 @@ func NewDefaultProvider(
 }
 
 //nolint:gocyclo
-func (p *DefaultProvider) List(ctx context.Context, nodeClass NodeClass) ([]*cloudprovider.InstanceType, error) {
+func (p *DefaultProvider) List(ctx context.Context, nodeClass NodeClass, includeUnavailable bool) ([]*cloudprovider.InstanceType, error) {
 	p.muInstanceTypesInfo.RLock()
 	p.muInstanceTypesOfferings.RLock()
 	defer p.muInstanceTypesInfo.RUnlock()
@@ -136,7 +136,7 @@ func (p *DefaultProvider) List(ctx context.Context, nodeClass NodeClass) ([]*clo
 		return nil, fmt.Errorf("no subnets found")
 	}
 
-	key := p.cacheKey(nodeClass)
+	key := p.cacheKey(nodeClass, includeUnavailable)
 	var instanceTypes []*cloudprovider.InstanceType
 	if item, ok := p.instanceTypesCache.Get(key); ok {
 		// Ensure what's returned from this function is a shallow-copy of the slice (not a deep-copy of the data itself)
@@ -161,6 +161,7 @@ func (p *DefaultProvider) List(ctx context.Context, nodeClass NodeClass) ([]*clo
 		instanceTypes,
 		nodeClass,
 		p.allZones,
+		includeUnavailable,
 	), nil
 }
 
@@ -180,7 +181,7 @@ func (p *DefaultProvider) Get(ctx context.Context, nodeClass NodeClass, name ec2
 		return nil, fmt.Errorf("no subnets found")
 	}
 	var instanceType *cloudprovider.InstanceType
-	if item, ok := p.instanceTypesCache.Get(p.cacheKey(nodeClass)); ok {
+	if item, ok := p.instanceTypesCache.Get(p.cacheKey(nodeClass, false)); ok {
 		instanceType, _ = lo.Find(item.([]*cloudprovider.InstanceType), func(i *cloudprovider.InstanceType) bool {
 			return ec2types.InstanceType(i.Name) == name
 		})
@@ -192,7 +193,7 @@ func (p *DefaultProvider) Get(ctx context.Context, nodeClass NodeClass, name ec2
 			return nil, err
 		}
 	}
-	return p.offeringProvider.InjectOfferings(ctx, []*cloudprovider.InstanceType{instanceType}, nodeClass, p.allZones)[0], nil
+	return p.offeringProvider.InjectOfferings(ctx, []*cloudprovider.InstanceType{instanceType}, nodeClass, p.allZones, false)[0], nil
 }
 
 func (p *DefaultProvider) get(ctx context.Context, nodeClass NodeClass, name ec2types.InstanceType) (*cloudprovider.InstanceType, error) {
@@ -216,15 +217,16 @@ func (p *DefaultProvider) get(ctx context.Context, nodeClass NodeClass, name ec2
 	return it, nil
 }
 
-func (p *DefaultProvider) cacheKey(nodeClass NodeClass) string {
+func (p *DefaultProvider) cacheKey(nodeClass NodeClass, includeUnavailable bool) string {
 	// Compute fully initialized instance types hash key
 	subnetZonesHash, _ := hashstructure.Hash(nodeClass.ZoneInfo(), hashstructure.FormatV2, &hashstructure.HashOptions{SlicesAsSets: true})
 	// Compute hash key against node class AMIs (used to force cache rebuild when AMIs change)
 	amiHash, _ := hashstructure.Hash(nodeClass.AMIs(), hashstructure.FormatV2, &hashstructure.HashOptions{SlicesAsSets: true})
-	return fmt.Sprintf("%016x-%016x-%s",
+	return fmt.Sprintf("%016x-%016x-%s-%t",
 		amiHash,
 		subnetZonesHash,
 		p.instanceTypesResolver.CacheKey(nodeClass),
+		includeUnavailable,
 	)
 }
 

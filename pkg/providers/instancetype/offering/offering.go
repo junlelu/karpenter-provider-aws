@@ -37,7 +37,7 @@ import (
 )
 
 type Provider interface {
-	InjectOfferings(context.Context, []*cloudprovider.InstanceType, *v1.EC2NodeClass, []string) []*cloudprovider.InstanceType
+	InjectOfferings(context.Context, []*cloudprovider.InstanceType, *v1.EC2NodeClass, []string, bool) []*cloudprovider.InstanceType
 }
 
 type NodeClass interface {
@@ -72,6 +72,7 @@ func (p *DefaultProvider) InjectOfferings(
 	instanceTypes []*cloudprovider.InstanceType,
 	nodeClass NodeClass,
 	allZones sets.Set[string],
+	includeUnavailable bool,
 ) []*cloudprovider.InstanceType {
 	subnetZonesToZoneIDs := lo.SliceToMap(nodeClass.ZoneInfo(), func(info v1.ZoneInfo) (string, string) {
 		return info.Zone, info.ZoneID
@@ -84,6 +85,7 @@ func (p *DefaultProvider) InjectOfferings(
 			nodeClass,
 			allZones,
 			subnetZonesToZoneIDs,
+			includeUnavailable,
 		)
 		// NOTE: By making this copy one level deep, we can modify the offerings without mutating the results from previous
 		// GetInstanceTypes calls. This should still be done with caution - it is currently done here in the provider, and
@@ -106,6 +108,7 @@ func (p *DefaultProvider) createOfferings(
 	nodeClass NodeClass,
 	allZones sets.Set[string],
 	subnetZonesToZoneIDs map[string]string,
+	includeUnavailable bool,
 ) cloudprovider.Offerings {
 	var offerings []*cloudprovider.Offering
 	itZones := sets.New(it.Requirements.Get(corev1.LabelTopologyZone).Values()...)
@@ -145,7 +148,7 @@ func (p *DefaultProvider) createOfferings(
 						scheduling.NewRequirement(v1.LabelCapacityReservationType, corev1.NodeSelectorOpDoesNotExist),
 					),
 					Price:     price,
-					Available: !isUnavailable && hasPrice && itZones.Has(zone),
+					Available: (!isUnavailable || includeUnavailable) && hasPrice && itZones.Has(zone),
 				}
 				if id, ok := subnetZonesToZoneIDs[zone]; ok {
 					offering.Requirements.Add(scheduling.NewRequirement(v1.LabelTopologyZoneID, corev1.NodeSelectorOpIn, id))

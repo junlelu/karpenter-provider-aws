@@ -159,6 +159,10 @@ var (
 	AnnotationEC2NodeClassHashVersion        = apis.Group + "/ec2nodeclass-hash-version"
 	AnnotationInstanceTagged                 = apis.Group + "/tagged"
 	AnnotationInstanceProfile                = apis.Group + "/instance-profile-name"
+	AnnotationOnDemandAllocationStrategy     = apis.Group + "/on-demand-allocation-strategy"
+	AnnotationFlexFleetBundleName            = apis.Group + "/flex-fleet-bundle-name"
+	AnnotationFlexFleetBundleMinCPU          = apis.Group + "/flex-fleet-bundle-min-cpu"
+	AnnotationFlexFleetBundleMinMemory       = apis.Group + "/flex-fleet-bundle-min-memory"
 
 	NodeClaimTagKey          = coreapis.Group + "/nodeclaim"
 	NameTagKey               = "Name"

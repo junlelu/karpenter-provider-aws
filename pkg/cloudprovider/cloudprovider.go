@@ -32,6 +32,7 @@ import (
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/events"
 	karpoptions "sigs.k8s.io/karpenter/pkg/operator/options"
+	"sigs.k8s.io/karpenter/pkg/scheduling"
 	"sigs.k8s.io/karpenter/pkg/utils/resources"
 
 	"github.com/aws/karpenter-provider-aws/pkg/apis"
@@ -120,7 +121,7 @@ func (c *CloudProvider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim)
 	if err != nil {
 		return nil, cloudprovider.NewNodeClassNotReadyError(err)
 	}
-	instanceTypes, err := c.instanceTypeProvider.List(ctx, nodeClass)
+	instanceTypes, err := c.resolveInstanceTypes(ctx, nodeClaim, nodeClass)
 	if err != nil {
 		return nil, cloudprovider.NewCreateError(fmt.Errorf("resolving instance types, %w", err), "InstanceTypeResolutionFailed", "Error resolving instance types")
 	}
@@ -197,6 +198,8 @@ func (c *CloudProvider) Get(ctx context.Context, providerID string) (*karpv1.Nod
 
 // GetInstanceTypes returns all available InstanceTypes
 func (c *CloudProvider) GetInstanceTypes(ctx context.Context, nodePool *karpv1.NodePool) ([]*cloudprovider.InstanceType, error) {
+	logger := log.FromContext(ctx)
+
 	nodeClass, err := c.resolveNodeClassFromNodePool(ctx, nodePool)
 	if err != nil {
 		if errors.IsNotFound(err) {
@@ -207,10 +210,40 @@ func (c *CloudProvider) GetInstanceTypes(ctx context.Context, nodePool *karpv1.N
 		return nil, fmt.Errorf("resolving nodeclass, %w", err)
 	}
 	// TODO, break this coupling
-	instanceTypes, err := c.instanceTypeProvider.List(ctx, nodeClass)
+	instanceTypes, err := c.instanceTypeProvider.List(ctx, nodeClass, false)
 	if err != nil {
 		return nil, err
 	}
+
+	// Check if flex fleet bundle annotations are present
+	if bundleName, exists := nodePool.Spec.Template.ObjectMeta.Annotations[v1.AnnotationFlexFleetBundleName]; exists {
+		// Get min CPU and memory from annotations
+		minMemoryStr, hasMemory := nodePool.Spec.Template.ObjectMeta.Annotations[v1.AnnotationFlexFleetBundleMinMemory]
+		minCPUStr, hasCPU := nodePool.Spec.Template.ObjectMeta.Annotations[v1.AnnotationFlexFleetBundleMinCPU]
+		
+		if hasCPU && hasMemory {
+			// Apply the constraints to all instance types
+			for _, instanceType := range instanceTypes {
+				// Create a deep copy to avoid modifying shared data
+				capacityCopy := make(corev1.ResourceList)
+				for k, v := range instanceType.Capacity {
+					capacityCopy[k] = v.DeepCopy()
+				}
+				
+				// Modify the copy with the minimum constraints
+				capacityCopy[corev1.ResourceMemory] = resource.MustParse(minMemoryStr)
+				capacityCopy[corev1.ResourceCPU] = resource.MustParse(minCPUStr)
+				
+				// Assign the modified copy back
+				instanceType.Capacity = capacityCopy
+			}
+		} else {
+			logger.Info("Flex bundle enabled but incorrect CPU or Memory configuration", 
+				"hasCPU", hasCPU, 
+				"hasMemory", hasMemory)
+		}
+	}
+
 	return instanceTypes, nil
 }
 
@@ -393,6 +426,74 @@ func (c *CloudProvider) resolveNodeClassFromInstance(ctx context.Context, instan
 		return nil, newTerminatingNodeClassError(nc.Name)
 	}
 	return nc, nil
+}
+
+func (c *CloudProvider) resolveInstanceTypes(ctx context.Context, nodeClaim *karpv1.NodeClaim, nodeClass *v1.EC2NodeClass) ([]*cloudprovider.InstanceType, error) {
+    if instance.IsAllocationStrategyFlexible(nodeClaim) {
+    	// For ec2 flexible fleets, all of the instance types specified by the bundle need to be included in the create
+    	// fleet request, so we need to make sure nothing gets filtered out.
+
+    	// We ask the instance type provider to include unavailable instances in the list.
+    	instanceTypes, err := c.instanceTypeProvider.List(ctx, nodeClass, true)
+    	if err != nil {
+    		return nil, fmt.Errorf("getting instance types, %w", err)
+    	}
+
+    	// fmt.Println("All instance types: "  fmt.Sprint(lo.Map(instanceTypes, func(i *cloudprovider.InstanceType, _ int) string {return i.Name})))
+
+    	// Karpenter may have already pruned some instance types from the node claim (maybe because it thinks the instance
+    	// types are unavailable?), so we will throw the requirements away and reload them from the node pool.
+    	nodePool, err := c.resolveNodePoolFromNodeClass(ctx, nodeClaim)
+    	if err != nil {
+    		return nil, fmt.Errorf("resolving node pool, %w", err)
+    	}
+
+       	nodeClaim.Spec.Requirements = nodePool.Spec.Template.Spec.Requirements
+    	reqs := scheduling.NewNodeSelectorRequirementsWithMinValues(nodeClaim.Spec.Requirements...)
+
+    	resolvedInstanceTypes := lo.Filter(instanceTypes, func(i *cloudprovider.InstanceType, _ int) bool {
+    		return reqs.Compatible(i.Requirements, scheduling.AllowUndefinedWellKnownLabels) == nil
+    	})
+    	//fmt.Println("Resolved instance types: "  fmt.Sprint(lo.Map(resolvedInstanceTypes, func(i *cloudprovider.InstanceType, _ int) string { return i.Name })))
+
+    	// Karpenter is trying to bin-pack as many pods as possible onto new instances, but that causes some of the instances
+    	// to not fit the request if the selected instances have different amounts of cpu/memory/etc...
+    	// Just going to remove this for now.
+    	//removedInstanceTypes := lo.Filter(resolvedInstanceTypes, func(i *cloudprovider.InstanceType, _ int) bool {
+    	//	return !resources.Fits(nodeClaim.Spec.Resources.Requests, i.Allocatable())
+    	//})
+    	//if len(removedInstanceTypes) != 0 {
+       	//	return nil, fmt.Errorf("some of the requested instance types can not fit the requested resources while using the \"flexible\" allocation strategy, which requires the requested instance types to exactly match those in the bundle"
+    	//		"requested instance types: %v, removed instance types: %v, resource requests: %v",
+    	//		lo.Map(resolvedInstanceTypes, func(i *cloudprovider.InstanceType, _ int) string { return i.Name }),
+    	//		lo.Map(removedInstanceTypes, func(i *cloudprovider.InstanceType, _ int) string { return i.Name }),
+    	//		nodeClaim.Spec.Resources.Requests)
+    	//}
+
+    	return resolvedInstanceTypes, nil
+    } else {
+    	reqs := scheduling.NewNodeSelectorRequirementsWithMinValues(nodeClaim.Spec.Requirements...)
+    	instanceTypes, err := c.instanceTypeProvider.List(ctx, nodeClass, false)
+    	if err != nil {
+    		return nil, fmt.Errorf("getting instance types, %w", err)
+    	}
+    	return lo.Filter(instanceTypes, func(i *cloudprovider.InstanceType, _ int) bool {
+    		return reqs.Compatible(i.Requirements, scheduling.AllowUndefinedWellKnownLabels) == nil &&
+    			len(i.Offerings.Compatible(reqs).Available()) > 0 &&
+    			resources.Fits(nodeClaim.Spec.Resources.Requests, i.Allocatable())
+    	}), nil
+    }
+}
+
+func (c *CloudProvider) resolveNodePoolFromNodeClass(ctx context.Context, nodeClaim *karpv1.NodeClaim) (*karpv1.NodePool, error) {
+	if nodePoolName, ok := nodeClaim.Labels[karpv1.NodePoolLabelKey]; ok {
+		nodePool := &karpv1.NodePool{}
+		if err := c.kubeClient.Get(ctx, types.NamespacedName{Name: nodePoolName}, nodePool); err != nil {
+			return nil, err
+		}
+		return nodePool, nil
+	}
+	return nil, errors.NewNotFound(schema.GroupResource{Group: coreapis.Group, Resource: "nodepools"}, "")
 }
 
 func (c *CloudProvider) resolveNodePoolFromInstance(ctx context.Context, instance *instance.Instance) (*karpv1.NodePool, error) {

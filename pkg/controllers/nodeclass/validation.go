@@ -446,7 +446,7 @@ func (v *Validation) getPrioritizedInstanceTypes(ctx context.Context, nodeClass 
 // requirements of linked NodePools. If no NodePools exist for the given NodeClass, this function returns two default
 // instance types (one x86_64 and one arm64).
 func (v *Validation) getInstanceTypesForNodeClass(ctx context.Context, nodeClass *v1.EC2NodeClass) ([]*cloudprovider.InstanceType, error) {
-	instanceTypes, err := v.instanceTypeProvider.List(ctx, nodeClass)
+	instanceTypes, err := v.instanceTypeProvider.List(ctx, nodeClass, false)
 	if err != nil {
 		return nil, fmt.Errorf("listing instance types for nodeclass, %w", err)
 	}
