@@ -18,6 +18,7 @@ import (
 	"context"
 	stderrors "errors"
 	"fmt"
+	"strings"
 	"time"
 
 	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
@@ -135,6 +136,15 @@ func (c *CloudProvider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim)
 			}
 		}
 	}
+	// For flexible fleet, pass the full instance type names to the instance provider via an in-memory
+	// annotation so it can inject them as additional CreateFleet overrides after filtering.
+	if strategy, ok := nodeClaim.Annotations[v1.AnnotationOnDemandAllocationStrategy]; ok && strategy == "flexible" {
+		allNames := lo.Map(instanceTypes, func(it *cloudprovider.InstanceType, _ int) string { return it.Name })
+		if nodeClaim.Annotations == nil {
+			nodeClaim.Annotations = map[string]string{}
+		}
+		nodeClaim.Annotations[v1.AnnotationOnDemandAllocationStrategy+"-instance-types"] = strings.Join(allNames, ",")
+	}
 	instance, err := c.instanceProvider.Create(ctx, nodeClass, nodeClaim, tags, instanceTypes)
 	if err != nil {
 		return nil, fmt.Errorf("creating instance, %w", err)
@@ -210,6 +220,11 @@ func (c *CloudProvider) GetInstanceTypes(ctx context.Context, nodePool *karpv1.N
 	instanceTypes, err := c.instanceTypeProvider.List(ctx, nodeClass)
 	if err != nil {
 		return nil, err
+	}
+	// For flexible fleet, adjust capacity to min(CPU, Memory, Pods) across all types
+	// so the scheduler doesn't over-schedule onto a smaller instance EC2 might select.
+	if strategy, ok := nodePool.Spec.Template.ObjectMeta.Annotations[v1.AnnotationOnDemandAllocationStrategy]; ok && strategy == "flexible" && len(instanceTypes) > 0 {
+		instanceTypes = adjustCapacityForFlexibleFleet(instanceTypes)
 	}
 	return instanceTypes, nil
 }
@@ -471,6 +486,40 @@ func (c *CloudProvider) instanceToNodeClaim(i *instance.Instance, instanceType *
 	nodeClaim.Status.ProviderID = fmt.Sprintf("aws:///%s/%s", i.Zone, i.ID)
 	nodeClaim.Status.ImageID = i.ImageID
 	return nodeClaim
+}
+
+// adjustCapacityForFlexibleFleet returns new InstanceType copies with capacity adjusted to
+// min(CPU, Memory, Pods) across all types. This ensures safe scheduling when EC2's flexible
+// fleet may return any instance type from the set.
+func adjustCapacityForFlexibleFleet(instanceTypes []*cloudprovider.InstanceType) []*cloudprovider.InstanceType {
+	minCPU := instanceTypes[0].Capacity.Cpu().DeepCopy()
+	minMemory := instanceTypes[0].Capacity.Memory().DeepCopy()
+	minPods := instanceTypes[0].Capacity.Pods().DeepCopy()
+	for _, it := range instanceTypes[1:] {
+		if it.Capacity.Cpu().Cmp(minCPU) < 0 {
+			minCPU = it.Capacity.Cpu().DeepCopy()
+		}
+		if it.Capacity.Memory().Cmp(minMemory) < 0 {
+			minMemory = it.Capacity.Memory().DeepCopy()
+		}
+		if it.Capacity.Pods().Cmp(minPods) < 0 {
+			minPods = it.Capacity.Pods().DeepCopy()
+		}
+	}
+	adjusted := make([]*cloudprovider.InstanceType, len(instanceTypes))
+	for i, it := range instanceTypes {
+		cap := make(corev1.ResourceList, len(it.Capacity))
+		for k, v := range it.Capacity {
+			cap[k] = v.DeepCopy()
+		}
+		cap[corev1.ResourceCPU] = minCPU.DeepCopy()
+		cap[corev1.ResourceMemory] = minMemory.DeepCopy()
+		cap[corev1.ResourcePods] = minPods.DeepCopy()
+		itCopy := *it
+		itCopy.Capacity = cap
+		adjusted[i] = &itCopy
+	}
+	return adjusted
 }
 
 // newTerminatingNodeClassError returns a NotFound error for handling by

@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 
 	awsmiddleware "github.com/aws/aws-sdk-go-v2/aws/middleware"
 	"github.com/awslabs/operatorpkg/aws/middleware"
@@ -339,6 +340,14 @@ func (p *DefaultProvider) launchInstance(
 		}
 		cfiBuilder.WithCapacityReservationType(*crt)
 	}
+
+	// For EC2 flexible fleet, set the allocation strategy and inject all NodePool instance types
+	// as additional overrides so EC2 can choose from the full set.
+	if strategy, ok := nodeClaim.Annotations[v1.AnnotationOnDemandAllocationStrategy]; ok && strategy == "flexible" {
+		cfiBuilder.WithAllocationStrategy(strategy)
+		injectFlexibleFleetOverrides(launchTemplateConfigs, nodeClaim, zonalSubnets)
+	}
+
 	createFleetInput := cfiBuilder.Build()
 
 	createFleetOutput, err := p.ec2Batcher.CreateFleet(ctx, createFleetInput)
@@ -602,6 +611,48 @@ func getCapacityReservationType(instanceTypes []*cloudprovider.InstanceType) *v1
 		}
 	}
 	return nil
+}
+
+// injectFlexibleFleetOverrides adds overrides for all instance types specified in the NodeClaim's requirements
+// to the existing launch template configs. This ensures EC2's flexible fleet strategy can choose from the full set
+// of instance types, even if Karpenter's filtering removed some. It reuses the AMI and subnets from existing overrides.
+func injectFlexibleFleetOverrides(launchTemplateConfigs []ec2types.FleetLaunchTemplateConfigRequest, nodeClaim *karpv1.NodeClaim, zonalSubnets map[string]*subnet.Subnet) {
+	if len(launchTemplateConfigs) == 0 {
+		return
+	}
+	// Collect instance types already present in overrides
+	existingTypes := sets.NewString()
+	for _, ltc := range launchTemplateConfigs {
+		for _, o := range ltc.Overrides {
+			existingTypes.Insert(string(o.InstanceType))
+		}
+	}
+	// Get the AMI from the first override (all overrides in a config share the same AMI)
+	var imageID string
+	if len(launchTemplateConfigs[0].Overrides) > 0 {
+		imageID = lo.FromPtr(launchTemplateConfigs[0].Overrides[0].ImageId)
+	}
+	// Get all instance types from the flexible fleet annotation (set by cloudprovider.go with the full list)
+	allTypesStr, ok := nodeClaim.Annotations[v1.AnnotationOnDemandAllocationStrategy+"-instance-types"]
+	if !ok {
+		return
+	}
+	allTypes := strings.Split(allTypesStr, ",")
+	// Add missing instance types as overrides to the first launch template config
+	for _, itName := range allTypes {
+		if existingTypes.Has(itName) {
+			continue
+		}
+		// Add an override for each available subnet/zone
+		for _, sub := range zonalSubnets {
+			launchTemplateConfigs[0].Overrides = append(launchTemplateConfigs[0].Overrides, ec2types.FleetLaunchTemplateOverridesRequest{
+				InstanceType:     ec2types.InstanceType(itName),
+				SubnetId:         lo.ToPtr(sub.ID),
+				ImageId:          lo.ToPtr(imageID),
+				AvailabilityZone: lo.ToPtr(sub.Zone),
+			})
+		}
+	}
 }
 
 func instancesFromOutput(ctx context.Context, out *ec2.DescribeInstancesOutput) ([]*Instance, error) {

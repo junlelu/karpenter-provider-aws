@@ -145,6 +145,7 @@ type CreateFleetInputBuilder struct {
 	contextID               *string
 	capacityReservationType v1.CapacityReservationType
 	overlay                 bool
+	allocationStrategy      *string
 }
 
 func NewCreateFleetInputBuilder(capacityType string, tags map[string]string, launchTemplateConfigs []ec2types.FleetLaunchTemplateConfigRequest) *CreateFleetInputBuilder {
@@ -170,6 +171,11 @@ func (b *CreateFleetInputBuilder) WithContextID(contextID string) *CreateFleetIn
 
 func (b *CreateFleetInputBuilder) WithOverlay() *CreateFleetInputBuilder {
 	b.overlay = true
+	return b
+}
+
+func (b *CreateFleetInputBuilder) WithAllocationStrategy(strategy string) *CreateFleetInputBuilder {
+	b.allocationStrategy = &strategy
 	return b
 }
 
@@ -211,8 +217,14 @@ func (b *CreateFleetInputBuilder) Build() *ec2.CreateFleetInput {
 			AllocationStrategy: lo.Ternary(b.overlay, ec2types.SpotAllocationStrategyCapacityOptimizedPrioritized, ec2types.SpotAllocationStrategyPriceCapacityOptimized),
 		}
 	} else if b.capacityReservationType != v1.CapacityReservationTypeCapacityBlock {
+		var allocationStrategy ec2types.FleetOnDemandAllocationStrategy
+		if b.allocationStrategy != nil && *b.allocationStrategy == "flexible" {
+			allocationStrategy = ec2types.FleetOnDemandAllocationStrategy("flexible")
+		} else {
+			allocationStrategy = lo.Ternary(b.overlay, ec2types.FleetOnDemandAllocationStrategyPrioritized, ec2types.FleetOnDemandAllocationStrategyLowestPrice)
+		}
 		input.OnDemandOptions = &ec2types.OnDemandOptionsRequest{
-			AllocationStrategy: lo.Ternary(b.overlay, ec2types.FleetOnDemandAllocationStrategyPrioritized, ec2types.FleetOnDemandAllocationStrategyLowestPrice),
+			AllocationStrategy: allocationStrategy,
 		}
 	}
 	return input

@@ -169,6 +169,11 @@ var (
 	AnnotationEC2NodeClassHashVersion        = apis.Group + "/ec2nodeclass-hash-version"
 	AnnotationInstanceTagged                 = apis.Group + "/tagged"
 	AnnotationInstanceProfile                = apis.Group + "/instance-profile-name"
+	// AnnotationOnDemandAllocationStrategy overrides the EC2 CreateFleet on-demand allocation strategy.
+	// Supported values: "lowest-price" (default), "prioritized", "flexible".
+	// When "flexible", all NodePool-specified instance types are included in the CreateFleet request
+	// and instance type capacities are adjusted to min(CPU, Memory, Pods) for safe scheduling.
+	AnnotationOnDemandAllocationStrategy = apis.Group + "/on-demand-allocation-strategy"
 
 	NodeClaimTagKey          = coreapis.Group + "/nodeclaim"
 	NameTagKey               = "Name"

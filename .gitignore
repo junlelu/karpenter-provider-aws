@@ -16,4 +16,6 @@ go.work.sum
 *.csv
 
 # Binary output
+karpenter-provider-aws-*controller
+controller
 karpenter-provider-aws-*
