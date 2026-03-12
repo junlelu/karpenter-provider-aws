@@ -131,9 +131,13 @@ func NewDefaultProvider(
 }
 
 func (p *DefaultProvider) Create(ctx context.Context, nodeClass *v1.EC2NodeClass, nodeClaim *karpv1.NodeClaim, tags map[string]string, instanceTypes []*cloudprovider.InstanceType) (*Instance, error) {
-	instanceTypes, err := p.filterInstanceTypes(ctx, instanceTypes, nodeClaim)
-	if err != nil {
-		return nil, err
+	// For flexible fleet, skip ALL filtering and use original instance types
+	if !IsAllocationStrategyFlexible(nodeClaim) {
+		var err error
+		instanceTypes, err = p.filterInstanceTypes(ctx, instanceTypes, nodeClaim)
+		if err != nil {
+			return nil, err
+		}
 	}
 	capacityType := getCapacityType(nodeClaim, instanceTypes)
 	tenancyType := getTenancyType(nodeClaim)
@@ -339,6 +343,13 @@ func (p *DefaultProvider) launchInstance(
 		}
 		cfiBuilder.WithCapacityReservationType(*crt)
 	}
+
+	// Set allocation strategy for flexible fleet if specified
+	allocationStrategy := getOnDemandAllocationStrategy(nodeClaim)
+	if allocationStrategy == "flexible" {
+		cfiBuilder.WithAllocationStrategy(allocationStrategy)
+	}
+
 	createFleetInput := cfiBuilder.Build()
 
 	createFleetOutput, err := p.ec2Batcher.CreateFleet(ctx, createFleetInput)
@@ -353,7 +364,17 @@ func (p *DefaultProvider) launchInstance(
 		}
 		return ec2types.CreateFleetInstance{}, cloudprovider.NewCreateError(fmt.Errorf("creating fleet request, %w", err), reason, fmt.Sprintf("Error creating fleet request: %s", message))
 	}
-	p.updateUnavailableOfferingsCache(ctx, createFleetOutput.Errors, capacityType, nodeClaim, instanceTypes, aws.ToString(createFleetOutput.FleetId))
+	// Unavailable Offering cache is turned off for flexible fleet as suggested by flex-fleet and karpenter teams
+	// (avoids removing instances that have ICE'd — AWS handles selection across all instance types)
+	if IsAllocationStrategyFlexible(nodeClaim) {
+		if len(createFleetOutput.Errors) > 0 {
+			log.FromContext(ctx).V(1).Info("flexible fleet: skipping unavailable offerings cache update",
+				"error-count", len(createFleetOutput.Errors),
+				"fleet-id", aws.ToString(createFleetOutput.FleetId))
+		}
+	} else {
+		p.updateUnavailableOfferingsCache(ctx, createFleetOutput.Errors, capacityType, nodeClaim, instanceTypes, aws.ToString(createFleetOutput.FleetId))
+	}
 	if len(createFleetOutput.Instances) == 0 || len(createFleetOutput.Instances[0].InstanceIds) == 0 {
 		requestID, _ := awsmiddleware.GetRequestIDMetadata(createFleetOutput.ResultMetadata)
 		return ec2types.CreateFleetInstance{}, serrors.Wrap(
@@ -407,7 +428,7 @@ func (p *DefaultProvider) getLaunchTemplateConfigs(
 	requirements[karpv1.CapacityTypeLabelKey] = scheduling.NewRequirement(karpv1.CapacityTypeLabelKey, corev1.NodeSelectorOpIn, capacityType)
 	for _, launchTemplate := range launchTemplates {
 		launchTemplateConfig := ec2types.FleetLaunchTemplateConfigRequest{
-			Overrides: p.getOverrides(launchTemplate.InstanceTypes, zonalSubnets, requirements, launchTemplate.ImageID, launchTemplate.CapacityReservationID),
+			Overrides: p.getOverrides(launchTemplate.InstanceTypes, zonalSubnets, requirements, launchTemplate.ImageID, launchTemplate.CapacityReservationID, nodeClaim),
 			LaunchTemplateSpecification: &ec2types.FleetLaunchTemplateSpecificationRequest{
 				LaunchTemplateName: aws.String(launchTemplate.Name),
 				Version:            aws.String("$Latest"),
@@ -430,6 +451,7 @@ func (p *DefaultProvider) getOverrides(
 	zonalSubnets map[string]*subnet.Subnet,
 	reqs scheduling.Requirements,
 	image, capacityReservationID string,
+	nodeClaim *karpv1.NodeClaim,
 ) []ec2types.FleetLaunchTemplateOverridesRequest {
 	// Unwrap all the offerings to a flat slice that includes a pointer
 	// to the parent instance type name
@@ -439,11 +461,18 @@ func (p *DefaultProvider) getOverrides(
 	}
 	var filteredOfferings []offeringWithParentName
 	for _, it := range instanceTypes {
-		ofs := it.Offerings.Available().Compatible(reqs)
+		var ofs []*cloudprovider.Offering
+		// For flexible fleet, include ALL offerings (available and unavailable)
+		// to let AWS handle the selection. For regular fleet, only use available offerings.
+		if IsAllocationStrategyFlexible(nodeClaim) {
+			ofs = it.Offerings.Compatible(reqs)
+		} else {
+			ofs = it.Offerings.Available().Compatible(reqs)
+		}
 		// If we are generating a launch template for a specific capacity reservation, we only want to include the offering
 		// for that capacity reservation when generating overrides.
 		if capacityReservationID != "" {
-			ofs = ofs.Compatible(scheduling.NewRequirements(scheduling.NewRequirement(
+			ofs = cloudprovider.Offerings(ofs).Compatible(scheduling.NewRequirements(scheduling.NewRequirement(
 				cloudprovider.ReservationIDLabel,
 				corev1.NodeSelectorOpIn,
 				capacityReservationID,
@@ -602,6 +631,20 @@ func getCapacityReservationType(instanceTypes []*cloudprovider.InstanceType) *v1
 		}
 	}
 	return nil
+}
+
+func getOnDemandAllocationStrategy(nodeClaim *karpv1.NodeClaim) string {
+	// take allocation strategy from nodepool annotations if present, otherwise default to lowest-price
+	allocationStrategy, ok := nodeClaim.Annotations[v1.AnnotationOnDemandAllocationStrategy]
+	if ok {
+		return allocationStrategy
+	} else {
+		return string(ec2types.FleetOnDemandAllocationStrategyLowestPrice)
+	}
+}
+
+func IsAllocationStrategyFlexible(nodeClaim *karpv1.NodeClaim) bool {
+	return getOnDemandAllocationStrategy(nodeClaim) == "flexible"
 }
 
 func instancesFromOutput(ctx context.Context, out *ec2.DescribeInstancesOutput) ([]*Instance, error) {

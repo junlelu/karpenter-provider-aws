@@ -169,6 +169,13 @@ var (
 	AnnotationEC2NodeClassHashVersion        = apis.Group + "/ec2nodeclass-hash-version"
 	AnnotationInstanceTagged                 = apis.Group + "/tagged"
 	AnnotationInstanceProfile                = apis.Group + "/instance-profile-name"
+	// AnnotationOnDemandAllocationStrategy allows overriding the EC2 CreateFleet on-demand allocation strategy.
+	// Supported values: "lowest-price" (default), "prioritized", "flexible".
+	// When set to "flexible", Karpenter delegates instance type selection entirely to EC2's Flexible fleet,
+	// bypassing its own instance type filtering, unavailable offerings cache, and launch template grouping.
+	// Instance type capacities are automatically adjusted to reflect the minimum across all eligible types,
+	// ensuring safe pod scheduling regardless of which instance type EC2 selects.
+	AnnotationOnDemandAllocationStrategy = apis.Group + "/on-demand-allocation-strategy"
 
 	NodeClaimTagKey          = coreapis.Group + "/nodeclaim"
 	NameTagKey               = "Name"

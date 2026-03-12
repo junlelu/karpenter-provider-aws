@@ -53,6 +53,7 @@ import (
 	"github.com/aws/karpenter-provider-aws/pkg/providers/securitygroup"
 
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
+	"sigs.k8s.io/karpenter/pkg/scheduling"
 )
 
 var _ cloudprovider.CloudProvider = (*CloudProvider)(nil)
@@ -120,7 +121,7 @@ func (c *CloudProvider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim)
 	if err != nil {
 		return nil, cloudprovider.NewNodeClassNotReadyError(err)
 	}
-	instanceTypes, err := c.instanceTypeProvider.List(ctx, nodeClass)
+	instanceTypes, err := c.resolveInstanceTypes(ctx, nodeClaim, nodeClass)
 	if err != nil {
 		return nil, cloudprovider.NewCreateError(fmt.Errorf("resolving instance types, %w", err), "InstanceTypeResolutionFailed", "Error resolving instance types")
 	}
@@ -197,6 +198,8 @@ func (c *CloudProvider) Get(ctx context.Context, providerID string) (*karpv1.Nod
 
 // GetInstanceTypes returns all available InstanceTypes
 func (c *CloudProvider) GetInstanceTypes(ctx context.Context, nodePool *karpv1.NodePool) ([]*cloudprovider.InstanceType, error) {
+	logger := log.FromContext(ctx)
+
 	nodeClass, err := c.resolveNodeClassFromNodePool(ctx, nodePool)
 	if err != nil {
 		if errors.IsNotFound(err) {
@@ -211,6 +214,19 @@ func (c *CloudProvider) GetInstanceTypes(ctx context.Context, nodePool *karpv1.N
 	if err != nil {
 		return nil, err
 	}
+
+	// When using flexible fleet allocation, EC2 may return any instance type from the set.
+	// To ensure safe pod scheduling, we adjust each instance type's advertised capacity to the
+	// minimum across all eligible types. This way Karpenter won't over-schedule pods onto an
+	// instance that happens to be the smallest in the bundle.
+	if _, exists := nodePool.Spec.Template.ObjectMeta.Annotations[v1.AnnotationOnDemandAllocationStrategy]; exists {
+		if nodePool.Spec.Template.ObjectMeta.Annotations[v1.AnnotationOnDemandAllocationStrategy] == "flexible" && len(instanceTypes) > 0 {
+			instanceTypes = adjustCapacityForFlexibleFleet(instanceTypes)
+			logger.V(1).Info("adjusted instance type capacities for flexible fleet",
+				"instance-type-count", len(instanceTypes))
+		}
+	}
+
 	return instanceTypes, nil
 }
 
@@ -471,6 +487,99 @@ func (c *CloudProvider) instanceToNodeClaim(i *instance.Instance, instanceType *
 	nodeClaim.Status.ProviderID = fmt.Sprintf("aws:///%s/%s", i.Zone, i.ID)
 	nodeClaim.Status.ImageID = i.ImageID
 	return nodeClaim
+}
+
+func (c *CloudProvider) resolveInstanceTypes(ctx context.Context, nodeClaim *karpv1.NodeClaim, nodeClass *v1.EC2NodeClass) ([]*cloudprovider.InstanceType, error) {
+	if instance.IsAllocationStrategyFlexible(nodeClaim) {
+		// For ec2 flexible fleets, all of the instance types specified by the bundle need to be included in the create
+		// fleet request, so we need to make sure nothing gets filtered out.
+		instanceTypes, err := c.instanceTypeProvider.List(ctx, nodeClass)
+		if err != nil {
+			return nil, fmt.Errorf("getting instance types, %w", err)
+		}
+
+		// Karpenter may have already pruned some instance types from the NodeClaim's requirements
+		// (e.g., based on cached availability). For flexible fleet, we reload the original requirements
+		// from the parent NodePool to ensure the full set of instance types is preserved.
+		// NOTE: We use a local variable to avoid mutating the NodeClaim object, which could have
+		// unintended side-effects on other code reading the same NodeClaim.
+		nodePool, err := c.resolveNodePoolFromNodeClass(ctx, nodeClaim)
+		if err != nil {
+			return nil, fmt.Errorf("resolving node pool, %w", err)
+		}
+		reqs := scheduling.NewNodeSelectorRequirementsWithMinValues(nodePool.Spec.Template.Spec.Requirements...)
+
+		resolvedInstanceTypes := lo.Filter(instanceTypes, func(i *cloudprovider.InstanceType, _ int) bool {
+			return reqs.Compatible(i.Requirements, scheduling.AllowUndefinedWellKnownLabels) == nil
+		})
+
+		return resolvedInstanceTypes, nil
+	}
+
+	instanceTypes, err := c.instanceTypeProvider.List(ctx, nodeClass)
+	if err != nil {
+		return nil, fmt.Errorf("getting instance types, %w", err)
+	}
+	return instanceTypes, nil
+}
+
+func (c *CloudProvider) resolveNodePoolFromNodeClass(ctx context.Context, nodeClaim *karpv1.NodeClaim) (*karpv1.NodePool, error) {
+	if nodePoolName, ok := nodeClaim.Labels[karpv1.NodePoolLabelKey]; ok {
+		nodePool := &karpv1.NodePool{}
+		if err := c.kubeClient.Get(ctx, types.NamespacedName{Name: nodePoolName}, nodePool); err != nil {
+			return nil, err
+		}
+		return nodePool, nil
+	}
+	return nil, errors.NewNotFound(schema.GroupResource{Group: coreapis.Group, Resource: "nodepools"}, "")
+}
+
+// adjustCapacityForFlexibleFleet adjusts the advertised capacity of each instance type
+// to the minimum across all types for CPU, memory, and pods. This is necessary because
+// EC2's flexible fleet may return any instance type from the set, and Karpenter's scheduler
+// must not assume a specific instance type's capacity when bin-packing pods.
+//
+// Each instance type gets a deep copy of its capacity to avoid polluting cached values.
+func adjustCapacityForFlexibleFleet(instanceTypes []*cloudprovider.InstanceType) []*cloudprovider.InstanceType {
+	if len(instanceTypes) == 0 {
+		return instanceTypes
+	}
+
+	// Compute the minimum capacity across all instance types for key schedulable resources
+	minCPU := instanceTypes[0].Capacity.Cpu().DeepCopy()
+	minMemory := instanceTypes[0].Capacity.Memory().DeepCopy()
+	minPods := instanceTypes[0].Capacity.Pods().DeepCopy()
+
+	for _, it := range instanceTypes[1:] {
+		if it.Capacity.Cpu().Cmp(minCPU) < 0 {
+			minCPU = it.Capacity.Cpu().DeepCopy()
+		}
+		if it.Capacity.Memory().Cmp(minMemory) < 0 {
+			minMemory = it.Capacity.Memory().DeepCopy()
+		}
+		if it.Capacity.Pods().Cmp(minPods) < 0 {
+			minPods = it.Capacity.Pods().DeepCopy()
+		}
+	}
+
+	// Create new InstanceType copies with adjusted capacity to avoid mutating cached pointers.
+	// The shallow struct copy gives us a fresh sync.Once, so Allocatable() will be recomputed
+	// from the new Capacity on first access.
+	adjusted := make([]*cloudprovider.InstanceType, len(instanceTypes))
+	for i, it := range instanceTypes {
+		capacityCopy := make(corev1.ResourceList, len(it.Capacity))
+		for k, v := range it.Capacity {
+			capacityCopy[k] = v.DeepCopy()
+		}
+		capacityCopy[corev1.ResourceCPU] = minCPU.DeepCopy()
+		capacityCopy[corev1.ResourceMemory] = minMemory.DeepCopy()
+		capacityCopy[corev1.ResourcePods] = minPods.DeepCopy()
+
+		itCopy := *it // shallow struct copy — fresh sync.Once, shared Requirements/Offerings/Overhead
+		itCopy.Capacity = capacityCopy
+		adjusted[i] = &itCopy
+	}
+	return adjusted
 }
 
 // newTerminatingNodeClassError returns a NotFound error for handling by

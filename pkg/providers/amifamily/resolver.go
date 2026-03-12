@@ -143,22 +143,61 @@ func (r DefaultResolver) Resolve(nodeClass *v1.EC2NodeClass, nodeClaim *karpv1.N
 	}
 	var resolvedTemplates []*LaunchTemplate
 	for amiID, instanceTypes := range mappedAMIs {
-		// In order to support reserved ENIs for CNI custom networking setups,
-		// we need to pass down the max-pods calculation to the kubelet.
-		// This requires that we resolve a unique launch template per max-pods value.
-		// Similarly, instance types configured with EFAs require unique launch templates depending on the number of
-		// EFAs they support.
-		// Reservations IDs are also included since we need to create a separate LaunchTemplate per reservation ID when
-		// launching reserved capacity. If it's a reserved capacity launch, we've already filtered the instance types
-		// further up the call stack.
-		type launchTemplateParams struct {
-			efaCount int
-			maxPods  int
-			// reservationIDs is encoded as a string rather than a slice to ensure this type is comparable for use by `lo.GroupBy`.
-			reservationIDs  string
-			reservationType v1.CapacityReservationType
-		}
-		paramsToInstanceTypes := lo.GroupBy(instanceTypes, func(it *cloudprovider.InstanceType) launchTemplateParams {
+		// For flexible fleet, group ALL instance types into a single launch template
+		// ignoring max-pods and EFA differences to let AWS handle the selection
+		if isAllocationStrategyFlexible(nodeClaim) {
+			// Use the highest max-pods value among all instance types for the launch template
+			maxPods := lo.MaxBy(instanceTypes, func(a, b *cloudprovider.InstanceType) bool {
+				return int(a.Capacity.Pods().Value()) > int(b.Capacity.Pods().Value())
+			})
+			maxPodsValue := int(maxPods.Capacity.Pods().Value())
+
+			// Use the highest EFA count if EFA is requested
+			efaCount := 0
+			if lo.Contains(lo.Keys(nodeClaim.Spec.Resources.Requests), v1.ResourceEFA) {
+				maxEFA := lo.MaxBy(instanceTypes, func(a, b *cloudprovider.InstanceType) bool {
+					return int(lo.ToPtr(a.Capacity[v1.ResourceEFA]).Value()) > int(lo.ToPtr(b.Capacity[v1.ResourceEFA]).Value())
+				})
+				efaCount = int(lo.ToPtr(maxEFA.Capacity[v1.ResourceEFA]).Value())
+			}
+
+			// Handle reserved capacity if applicable
+			var reservationIDs []string
+			var reservationType v1.CapacityReservationType
+			if capacityType == karpv1.CapacityTypeReserved {
+				reservationSet := make(map[string]bool)
+				for _, it := range instanceTypes {
+					for _, o := range it.Offerings {
+						if o.CapacityType() != karpv1.CapacityTypeReserved {
+							continue
+						}
+						reservationSet[o.ReservationID()] = true
+						if reservationType == "" {
+							reservationType = v1.CapacityReservationType(o.Requirements.Get(v1.LabelCapacityReservationType).Any())
+						}
+					}
+				}
+				reservationIDs = lo.Keys(reservationSet)
+			}
+
+			resolvedTemplates = append(resolvedTemplates, r.resolveLaunchTemplates(nodeClass, nodeClaim, instanceTypes, capacityType, amiFamily, amiID, maxPodsValue, efaCount, reservationIDs, reservationType, options, tenancyType)...)
+		} else {
+			// Regular behavior: In order to support reserved ENIs for CNI custom networking setups,
+			// we need to pass down the max-pods calculation to the kubelet.
+			// This requires that we resolve a unique launch template per max-pods value.
+			// Similarly, instance types configured with EFAs require unique launch templates depending on the number of
+			// EFAs they support.
+			// Reservations IDs are also included since we need to create a separate LaunchTemplate per reservation ID when
+			// launching reserved capacity. If it's a reserved capacity launch, we've already filtered the instance types
+			// further up the call stack.
+			type launchTemplateParams struct {
+				efaCount int
+				maxPods  int
+				// reservationIDs is encoded as a string rather than a slice to ensure this type is comparable for use by `lo.GroupBy`.
+				reservationIDs  string
+				reservationType v1.CapacityReservationType
+			}
+			paramsToInstanceTypes := lo.GroupBy(instanceTypes, func(it *cloudprovider.InstanceType) launchTemplateParams {
 			var reservationType v1.CapacityReservationType
 			var reservationIDs []string
 			if capacityType == karpv1.CapacityTypeReserved {
@@ -188,12 +227,19 @@ func (r DefaultResolver) Resolve(nodeClass *v1.EC2NodeClass, nodeClaim *karpv1.N
 			}
 		})
 
-		for params, instanceTypes := range paramsToInstanceTypes {
-			reservationIDs := strings.Split(params.reservationIDs, ",")
-			resolvedTemplates = append(resolvedTemplates, r.resolveLaunchTemplates(nodeClass, nodeClaim, instanceTypes, capacityType, amiFamily, amiID, params.maxPods, params.efaCount, reservationIDs, params.reservationType, options, tenancyType)...)
+			for params, instanceTypes := range paramsToInstanceTypes {
+				reservationIDs := strings.Split(params.reservationIDs, ",")
+				resolvedTemplates = append(resolvedTemplates, r.resolveLaunchTemplates(nodeClass, nodeClaim, instanceTypes, capacityType, amiFamily, amiID, params.maxPods, params.efaCount, reservationIDs, params.reservationType, options, tenancyType)...)
+			}
 		}
 	}
 	return resolvedTemplates, nil
+}
+
+// isAllocationStrategyFlexible checks if the nodeclaim uses flexible allocation strategy
+func isAllocationStrategyFlexible(nodeClaim *karpv1.NodeClaim) bool {
+	allocationStrategy, ok := nodeClaim.Annotations[v1.AnnotationOnDemandAllocationStrategy]
+	return ok && allocationStrategy == "flexible"
 }
 
 func GetAMIFamily(amiFamily string, options *Options) AMIFamily {
